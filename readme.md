@@ -20,7 +20,7 @@ $ cargo b
 ```
 $ dd if=/dev/zero of=hd.img bs=1M count=8
 $ mkfs.ext2 hd.img
-$ cargo r
+$ cargo r -- hd.img
 
 ```
 

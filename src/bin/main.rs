@@ -8,7 +8,12 @@ use ext2::fs::disk::{Disk, Offset};
 use ext2::fs::error::Error;
 
 fn main() {
-    let disk = FileDisk::open("/data/works/ext2-fs/hd.img").unwrap();
+    let args = std::env::args().collect::<Vec<String>>();
+    if args.len() <= 1{
+        println!("please give disk file path!");
+        return;
+    }
+    let disk = FileDisk::open(&*args[1]).unwrap();
     let mut fs = fs::mount(Box::new(disk)).unwrap();
 
     match fs.mk_dir("/test", 0o755) {
