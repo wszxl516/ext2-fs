@@ -1,5 +1,5 @@
 /target
 hd.img
-fs
+/fs
 .idea
 Cargo.lock
