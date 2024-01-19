@@ -1,16 +1,19 @@
-use crate::dir::DirEntry;
-use crate::disk::{BlockCache, Disk, Offset};
-use crate::ext2::dir::Ext2DirEntry;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::mem;
+use core::str;
+
+use crate::{align_up, to_slice};
+use crate::ext2::dir::{Ext2DirEntry, Ext2DirEntryStruct};
+use crate::ext2::Ext2Filesystem;
 use crate::ext2::group::Ext2BlockGroups;
-use crate::inode::Inode;
-use crate::metadata::Metadata;
-use std::collections::BTreeMap;
-use std::io::Error;
-use std::io::ErrorKind;
-use std::io::Read;
-use std::mem;
-use std::slice;
-use std::str;
+use crate::fs::disk::{Disk, Offset};
+use crate::fs::error::Error;
+use crate::fs::io::CoreRead;
+use crate::fs::stat::{FileFlags, Mode, Stat};
 
 // Constants relative to the data blocks
 pub const EXT2_NDIR_BLOCKS: usize = 12;
@@ -21,34 +24,71 @@ pub const EXT2_N_BLOCKS: usize = EXT2_TRIPLY_IND_BLOCK + 1;
 pub const I_BLOCKS_SIZE: usize = EXT2_N_BLOCKS * 4;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct Ext2InodeStruct {
-    pub i_mode: u16,        /* File mode */
-    pub i_uid: u16,         /* Low 16 bits of Owner Uid */
-    pub i_size: u32,        /* Lower 32 bits of size in bytes */
-    pub i_atime: u32,       /* Access time */
-    pub i_ctime: u32,       /* Creation time */
-    pub i_mtime: u32,       /* Modification time */
-    pub i_dtime: u32,       /* Deletion Time */
-    pub i_gid: u16,         /* Low 16 bits of Group Id */
-    pub i_links_count: u16, /* Links count */
-    pub i_blocks: u32,      /* Count of disk sectors (not Ext2 blocks) in use by this inode */
-    pub i_flags: u32,       /* File flags */
+    pub i_mode: u16,
+    /* File mode */
+    pub i_uid: u16,
+    /* Low 16 bits of Owner Uid */
+    pub i_size: u32,
+    /* Lower 32 bits of size in bytes */
+    pub i_atime: u32,
+    /* Access time */
+    pub i_ctime: u32,
+    /* Creation time */
+    pub i_mtime: u32,
+    /* Modification time */
+    pub i_dtime: u32,
+    /* Deletion Time */
+    pub i_gid: u16,
+    /* Low 16 bits of Group Id */
+    pub i_links_count: u16,
+    /* Links count */
+    pub i_blocks: u32,
+    /* Count of disk sectors (not Ext2 blocks) in use by this inode */
+    pub i_flags: u32,
+    /* File flags */
     pub l_i_reserved1: u32,
-    pub i_block: [u32; EXT2_N_BLOCKS], /* Pointers to blocks (12) +
-                                       1 Singly Indirect Block Pointer (Points to a block that is a list of block pointers to data)
-                                       1 Doubly Indirect Block Pointer (Points to a block that is a list of block pointers to Singly Indirect Blocks)
-                                       1 Triply Indirect Block Pointer (Points to a block that is a list of block pointers to Doubly Indirect Blocks) */
-    pub i_generation: u32, /* File version (for NFS) */
-    pub i_file_acl: u32,   /* File ACL */
+    pub i_block: [u32; EXT2_N_BLOCKS],
+    /* Pointers to blocks (12) */
+    pub i_generation: u32,
+    /* File version (for NFS) */
+    pub i_file_acl: u32,
+    /* File ACL */
     pub i_size_high: u32,
-    pub i_faddr: u32,  /* Fragment address */
-    pub l_i_frag: u8,  /* Fragment number */
-    pub l_i_fsize: u8, /* Fragment size */
+    pub i_faddr: u32,
+    /* Fragment address */
+    pub l_i_frag: u8,
+    /* Fragment number */
+    pub l_i_fsize: u8,
+    /* Fragment size */
     pub i_pad1: u16,
-    pub l_i_uid_high: u16, /* these 2 fields    */
-    pub l_i_gid_high: u16, /* were reserved2[0] */
+    pub l_i_uid_high: u16,
+    /* these 2 fields    */
+    pub l_i_gid_high: u16,
+    /* were reserved2[0] */
     pub l_i_reserved2: u32,
+}
+
+impl Ext2InodeStruct {
+    pub fn new_dir(perm: u16, first_block: u32, size: u32) -> Self {
+        let mut new = Self::default();
+        new.i_mode = Mode::DIRECTORY.bits() | perm;
+        new.i_links_count = 1;
+        new.i_block[0] = first_block;
+        new.i_blocks = 2;
+        new.i_size = size;
+        new
+    }
+    pub fn new_file(perm: u16, first_block: u32, size: u32) -> Self {
+        let mut new = Self::default();
+        new.i_mode = Mode::FILE.bits() | perm;
+        new.i_links_count = 1;
+        new.i_block[0] = first_block;
+        new.i_blocks = 2;
+        new.i_size = size;
+        new
+    }
 }
 
 impl Ext2InodeStruct {
@@ -56,24 +96,35 @@ impl Ext2InodeStruct {
         let ionode: Ext2InodeStruct = unsafe { mem::zeroed() };
         ionode
     }
+    pub fn is_file(&self) -> bool {
+        Mode::from_bits_truncate(self.i_mode).is_file()
+    }
     pub fn size(&self) -> u64 {
         // Calculate the size in bytes
-        if unix_mode::is_file(self.i_mode as u32) {
+        if self.is_file() {
             self.i_size as u64 | ((self.i_size_high as u64) << 32)
         } else {
             self.i_size as u64
         }
     }
+    pub const fn blocks(&self) -> [u32; EXT2_N_BLOCKS] {
+        self.i_block
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct Ext2Inode {
-    inode_num: u64,              // Inode number
-    ext2_inode: Ext2InodeStruct, // Ext2 inode struct
-    inode_size: u64,             // Inode size
-    block_size: u64,             // Block size
-    size: u64,                   // Size in bytes
-    data_blocks_count: u64,      // Number of data blocks
+    pub(crate) inode_num: u64,
+    // Inode number
+    pub(crate) ext2_inode: Ext2InodeStruct,
+    // Ext2 inode struct
+    pub(crate) inode_size: u64,
+    // Inode size
+    pub(crate) block_size: u64,
+    // Block size
+    pub(crate) size: u64,
+    // Size in bytes
+    pub(crate) data_blocks_count: u64, // Number of data blocks
 }
 
 impl Ext2Inode {
@@ -85,42 +136,59 @@ impl Ext2Inode {
         inode_num: u64,
     ) -> Result<Ext2Inode, Error> {
         // Determinate the block group
-        let group = block_groups.get_inode_group(inode_num);
+        let group = block_groups.get_inode_group(inode_num, disk)?;
         // Calculate the offset
-        let offset = Offset::BlockDelta {
-            block_size: block_size,
-            base_block_num: group.ext2_group_desc.bg_inode_table as u64,
-            delta: (inode_num - group.first_inode_num) as u64 * inode_size,
-        };
+        let offset = Offset::new_offset(
+            block_size,
+            group.ext2_group_desc.bg_inode_table as u64,
+            (inode_num - group.first_inode_num) * inode_size,
+        );
         // Read the inode from the disk
-        let buffer = disk.read(inode_size, offset)?;
-        let mut inode = Ext2InodeStruct::default();
-        let mut buf = buffer.as_slice();
-        let p = &mut inode as *mut _ as *mut u8;
-        unsafe {
-            let inode_slice = slice::from_raw_parts_mut(p, inode_size as usize);
-            buf.read_exact(inode_slice).unwrap();
-        }
+        let buffer = disk.read_at(&offset, inode_size)?;
+        let inode = buffer.as_slice().read_struct::<Ext2InodeStruct>()?;
         // Calculate the size
         let size = inode.size();
         // Calculate the number of data blocks
-        let data_blocks_count: u64 = (size as f64 / block_size as f64).ceil() as u64;
+        let data_blocks_count = size / block_size;
+        let data_blocks_count = match size % block_size == 0 {
+            true => data_blocks_count,
+            false => data_blocks_count + 1
+        };
         Ok(Ext2Inode {
-            inode_num: inode_num,
+            inode_num,
             ext2_inode: inode,
-            inode_size: inode_size,
-            block_size: block_size,
-            size: size,
-            data_blocks_count: data_blocks_count,
+            inode_size,
+            block_size,
+            size,
+            data_blocks_count,
         })
     }
 
+    pub fn write(&self, disk: &Box<dyn Disk>, block_groups: &Ext2BlockGroups) {
+        // Determinate the block group
+        let group = block_groups.get_inode_group(self.inode_num, disk).unwrap();
+        // Calculate the offset
+        let offset = Offset::new_offset(
+            self.block_size,
+            group.ext2_group_desc.bg_inode_table as u64,
+            (self.inode_num - group.first_inode_num) * self.inode_size,
+        );
+        self.ext2_inode;
+        disk.write_at(&offset, to_slice!(&self.ext2_inode, Ext2InodeStruct))
+            .unwrap();
+    }
+    pub fn blocks(&self) -> [u32; EXT2_N_BLOCKS] {
+        self.ext2_inode.blocks()
+    }
+    pub fn inode(&self) -> u64 {
+        self.inode_num
+    }
     /// Read blocks iterator
     pub fn read_blocks_iter<'a>(&'a self, disk: &'a Box<dyn Disk>) -> Result<ReadBlock<'a>, Error> {
         Ok(ReadBlock {
-            disk: disk,
+            disk: &Box::new(disk),
             block_size: self.block_size,
-            blocks: self.get_blocks_iter(disk)?,
+            blocks: self.get_blocks_iter(&disk)?,
         })
     }
 
@@ -150,10 +218,11 @@ impl Ext2Inode {
     pub fn get_child(
         &self,
         disk: &Box<dyn Disk>,
+        fs: &Ext2Filesystem,
         block_groups: &Ext2BlockGroups,
         name: &str,
     ) -> Option<Ext2Inode> {
-        match self.read_dir(disk, "") {
+        match self.read_dir(disk, fs, name) {
             Ok(entries) => match entries.get(name) {
                 Some(dir_entry) => Some(
                     Ext2Inode::new(
@@ -163,7 +232,7 @@ impl Ext2Inode {
                         block_groups,
                         dir_entry.inode_num(),
                     )
-                    .ok()?,
+                        .ok()?,
                 ),
                 None => None,
             },
@@ -174,55 +243,82 @@ impl Ext2Inode {
     /// Read value of a symbolic link
     pub fn read_link(&self, disk: &Box<dyn Disk>) -> Result<String, Error> {
         if !self.metadata().is_symlink() {
-            return Err(Error::new(ErrorKind::InvalidData, "is not a symbolic link"));
+            return Err(Error::InvalidData("is not a symbolic link".to_string()));
         }
-        // The target of a symbolic link is stored in the inode
-        // if it is less than 60 bytes long.
         if self.size <= I_BLOCKS_SIZE as u64 {
             let buffer: [u8; I_BLOCKS_SIZE] = unsafe { mem::transmute(self.ext2_inode.i_block) };
             let target = &buffer[0..self.size as usize];
             match str::from_utf8(target) {
                 Ok(result) => Ok(String::from(result)),
-                Err(e) => Err(Error::new(ErrorKind::InvalidData, e)),
+                Err(_) => Err(Error::InvalidData("read link name failed.".to_string())),
             }
         } else {
             match String::from_utf8(self.read(disk)?) {
                 Ok(result) => Ok(result),
-                Err(e) => Err(Error::new(ErrorKind::InvalidData, e)),
+                Err(_) => Err(Error::InvalidData("read link name failed.".to_string())),
             }
         }
     }
-}
-
-impl Inode for Ext2Inode {
-    /// Read a directory
-    fn read_dir(
+    pub fn read_dir(
         &self,
-        disk: &Box<dyn Disk>,
+        disk: &Box<(dyn Disk + 'static)>,
+        fs: &Ext2Filesystem,
         path: &str,
-    ) -> Result<BTreeMap<String, Box<dyn DirEntry>>, Error> {
+    ) -> Result<BTreeMap<String, Ext2DirEntry>, Error> {
         if !self.metadata().is_dir() {
-            Err(Error::new(ErrorKind::InvalidInput, "Not a directory"))
-            // Err(Error::new(ErrorKind::NotADirectory, "Not a directory"))
+            Err(Error::InvalidInput(format!("{} Not a directory", path)))
         } else {
-            let mut entries: BTreeMap<String, Box<dyn DirEntry>> = BTreeMap::new();
+            let mut entries: BTreeMap<String, Ext2DirEntry> = BTreeMap::new();
             // Iterate over blocks
             for buffer in self.read_blocks_iter(disk)? {
                 let buffer = buffer?;
                 let mut offset: usize = 0;
                 // Iterate over block directory entries
                 while offset < self.block_size as usize {
-                    let (dir_entry, rec_len) = Ext2DirEntry::new(&buffer, offset, path);
+                    let (mut dir_entry, rec_len) = Ext2DirEntry::new(&buffer, offset);
+                    dir_entry.get_inode(fs)?;
                     offset += rec_len;
-                    entries.insert(dir_entry.file_name(), Box::new(dir_entry));
+                    entries.insert(dir_entry.file_name(), dir_entry);
                 }
             }
             Ok(entries)
         }
     }
+    pub fn find_last_dir_entry(
+        &self,
+        disk: &Box<(dyn Disk + 'static)>,
+    ) -> Result<(u64, usize), Error> {
+        if !self.metadata().is_dir() {
+            Err(Error::InvalidInput(format!(
+                "inode {} Not a directory",
+                self.inode_num
+            )))
+        } else {
+            let mut block_num = 0usize;
+            let mut offset_block = 0usize;
+            let size = mem::size_of::<Ext2DirEntryStruct>();
+            'all_block: for buffer in self.read_blocks_iter(disk)? {
+                let buffer = buffer?;
+                let mut offset: usize = 0;
+                // Iterate over block directory entries
+                while offset < self.block_size as usize {
+                    let mut buf = &buffer[offset..offset + size];
+                    let entry = buf.read_struct::<Ext2DirEntryStruct>().unwrap();
+                    let entry_size = align_up!(entry.name_len as usize + size, 4);
+                    if entry_size < entry.rec_len.into() || entry.inode_num == 0 {
+                        offset_block = offset;
+                        break 'all_block;
+                    }
+                    offset += entry.rec_len as usize;
+                }
+                block_num += 1;
+            }
+            Ok((self.blocks()[block_num] as u64, offset_block))
+        }
+    }
 
     /// Block numbers
-    fn get_blocks(&self, disk: &Box<dyn Disk>) -> Result<Vec<u64>, Error> {
+    pub fn get_blocks(&self, disk: &Box<dyn Disk>) -> Result<Vec<u64>, Error> {
         match self.get_blocks_iter(disk) {
             Ok(iterator) => iterator.collect::<Result<Vec<_>, _>>(),
             Err(x) => Err(x),
@@ -230,25 +326,25 @@ impl Inode for Ext2Inode {
     }
 
     /// Block size in bytes
-    fn get_block_size(&self) -> u64 {
+    pub fn get_block_size(&self) -> u64 {
         self.block_size
     }
 
     /// Size in bytes
-    fn get_size(&self) -> u64 {
+    pub fn get_size(&self) -> u64 {
         self.size
     }
 
     /// Given a path, query the file system to get information about a file, directory, etc.
-    fn metadata(&self) -> Metadata {
-        Metadata {
-            dev: 0 as u64,
+    pub fn metadata(&self) -> Stat {
+        Stat {
+            dev: 0,
             ino: self.inode_num,
-            mode: self.ext2_inode.i_mode as u32,
+            mode: Mode::from_bits_truncate(self.ext2_inode.i_mode),
             nlink: self.ext2_inode.i_links_count as u64,
             uid: self.ext2_inode.i_uid as u32,
             gid: self.ext2_inode.i_gid as u32,
-            rdev: 0 as u64,
+            rdev: 0,
             size: self.size,
             atime: self.ext2_inode.i_atime as i64,
             atime_nsec: self.ext2_inode.i_atime as i64 * 1_000_000,
@@ -258,19 +354,22 @@ impl Inode for Ext2Inode {
             ctime_nsec: self.ext2_inode.i_ctime as i64 * 1_000_000,
             blksize: self.block_size,
             blocks: self.ext2_inode.i_blocks as u64,
+            flags: FileFlags::from_bits_truncate(self.ext2_inode.i_flags),
         }
     }
 }
 
 pub struct ReadBlockNum<'a> {
-    blocks_per_block: u64, // number of block number (each block number is sizeof u32) in a block
+    blocks_per_block: u64,
+    // number of block number (each block number is sizeof u32) in a block
     i_block: &'a [u32; EXT2_N_BLOCKS],
     data_blocks_count: u64,
-    cache: BlockCache<'a>,
+    block_size: u64,
     first_indirect_block: u64,
     first_doubly_indirect_block: u64,
     first_triply_indirect_block: u64,
     curr: u64,
+    disk: &'a Box<dyn Disk>,
 }
 
 impl ReadBlockNum<'_> {
@@ -282,16 +381,17 @@ impl ReadBlockNum<'_> {
     ) -> ReadBlockNum<'a> {
         let blocks_per_block = block_size / mem::size_of::<u32>() as u64;
         ReadBlockNum {
-            blocks_per_block: blocks_per_block,
-            i_block: i_block,
-            data_blocks_count: data_blocks_count,
-            cache: BlockCache::new(disk, block_size),
+            blocks_per_block,
+            i_block,
+            data_blocks_count,
+            block_size,
             first_indirect_block: EXT2_NDIR_BLOCKS as u64,
             first_doubly_indirect_block: EXT2_NDIR_BLOCKS as u64 + blocks_per_block,
             first_triply_indirect_block: EXT2_NDIR_BLOCKS as u64
                 + blocks_per_block
                 + (blocks_per_block * blocks_per_block),
             curr: 0,
+            disk,
         }
     }
 
@@ -302,7 +402,8 @@ impl ReadBlockNum<'_> {
 
     /// Get singly indirect block
     fn get_indirect_block(&mut self, i: u64, indirect_block_num: u64) -> Result<u64, Error> {
-        let indirect_blocks = self.cache.get_block(indirect_block_num)?;
+        let offset = Offset::new(self.block_size, indirect_block_num);
+        let indirect_blocks = self.disk.read_at(&offset, self.block_size)?;
         let addr: usize = i as usize * mem::size_of::<u32>();
         let bytes: [u8; 4] = indirect_blocks[addr..addr + 4]
             .try_into()
@@ -382,11 +483,8 @@ impl ReadBlock<'_> {
     }
 
     fn read_block(&mut self, block_num: u64) -> Result<Vec<u8>, Error> {
-        let offset = Offset::Block {
-            block_size: self.block_size,
-            block_num: block_num,
-        };
-        self.disk.read(self.block_size, offset)
+        let offset = Offset::new(self.block_size, block_num);
+        self.disk.read_at(&offset, self.block_size)
     }
 }
 

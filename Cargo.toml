@@ -1,5 +1,5 @@
 [package]
-name = "ext2"
+name = "ext2-fs"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,8 +9,15 @@ edition = "2021"
 opt-level = 0  # Controls the --opt-level the compiler builds with
 debug = true   # Controls whether the compiler passes `-g`
 
+
+
+[[bin]]
+name = "test"
+path = "src/bin/main.rs"
+
+[lib]
+name = "ext2"
+path = "src/lib.rs"
+
 [dependencies]
-chrono = "0.4.22"
-unix_mode = "0.1.2"
-argparse = "0.2.2"
-humansize = "1.1.1"
+bitflags = { version = "2.4.1", features = [] }
